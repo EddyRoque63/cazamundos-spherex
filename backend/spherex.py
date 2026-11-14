@@ -2,7 +2,7 @@
 Acceso a datos SPHEREx en IRSA (NASA/IPAC Infrared Science Archive).
 
 Flujo:
-  1. Consulta TAP a IRSA: qué imágenes espectrales SPHEREx cubren (RA, Dec).
+  1. Consulta SIA2 a IRSA (colección DR1 y otras): qué imágenes cubren (RA, Dec).
   2. Descarga recortes ("cutouts") de cada imagen (con caché en disco).
   3. Resta la luz zodiacal (extensión ZODI) y reproyecta cada recorte a una
      cuadrícula común (proyección TAN centrada en el objetivo) para que todas
@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import math
+import os
 import threading
 import time
 import uuid
@@ -37,7 +38,6 @@ warnings.filterwarnings("ignore", category=FITSFixedWarning)
 warnings.filterwarnings("ignore", message=".*datfix.*")
 
 IRSA = "https://irsa.ipac.caltech.edu"
-TAP_URL = IRSA + "/TAP"
 CACHE_DIR = Path(__file__).resolve().parent / "cache" / "cutouts"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -60,40 +60,70 @@ DETECTORS = {
 # --------------------------------------------------------------------------
 # Consulta de metadatos
 # --------------------------------------------------------------------------
+# Colecciones de IRSA a consultar, en orden de preferencia. IRSA reorganiza
+# los lanzamientos de SPHEREx (QR → DR1 → …): se puede cambiar sin tocar el
+# código con la variable de entorno SPHEREX_COLLECTIONS.
+COLLECTIONS = [c.strip() for c in os.environ.get(
+    "SPHEREX_COLLECTIONS", "spherex_dr1,spherex_qr3,spherex_qr2,spherex_qr").split(",") if c.strip()]
+SIA_URL = IRSA + "/SIA"
+
+
+def _sia(collection: str, ra: float, dec: float) -> list[dict]:
+    """Consulta SIA2 (rápida) de una colección SPHEREx en IRSA."""
+    import io
+    from astropy.io.votable import parse_single_table
+
+    params = {
+        "COLLECTION": collection,
+        "POS": f"circle {ra:.8f} {dec:.8f} 0.0005",
+        "RESPONSEFORMAT": "VOTABLE",
+        "MAXREC": "20000",
+    }
+    r = requests.get(SIA_URL, params=params, timeout=120)
+    r.raise_for_status()
+    table = parse_single_table(io.BytesIO(r.content)).to_table()
+    rows = []
+    for row in table:
+        try:
+            url = str(row["access_url"]).strip()
+            band = str(row["energy_bandpassname"]).strip()
+            mjd = float(row["t_min"])
+            obs = str(row["obs_id"]).strip()
+        except (KeyError, TypeError, ValueError):
+            continue
+        sub = str(row["dataproduct_subtype"]).strip().lower() if "dataproduct_subtype" in table.colnames else "science"
+        if not url.lower().endswith(".fits") or "spherex-d" not in band.lower() or sub not in ("science", ""):
+            continue
+        rows.append({"base": url, "mjd": mjd, "band": band, "obs": obs, "collection": collection})
+    return rows
+
+
 def query_images(ra: float, dec: float, size_deg: float) -> list[dict]:
     """Lista de imágenes SPHEREx que contienen (ra, dec), de la más antigua a la más reciente."""
-    import pyvo
-
-    svc = pyvo.dal.TAPService(TAP_URL)
-    adql = f"""
-        SELECT a.uri AS path, p.time_bounds_lower AS mjd, p.energy_bandpassname AS band
-        FROM spherex.artifact a
-        JOIN spherex.plane p ON a.planeid = p.planeid
-        WHERE 1 = CONTAINS(POINT('ICRS', {ra:.8f}, {dec:.8f}), p.poly)
-        ORDER BY p.time_bounds_lower
-    """
-    table = svc.search(adql).to_table()
+    found, errors = [], []
+    for col in COLLECTIONS:
+        try:
+            found.extend(_sia(col, ra, dec))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{col}: {exc}")
+            print("Aviso SIA", col, exc)
+    if not found and errors and len(errors) == len(COLLECTIONS):
+        raise RuntimeError("No se pudo consultar IRSA: " + "; ".join(errors))
 
     rows, seen = [], set()
-    for r in table:
-        path = str(r["path"]).strip()
-        band = str(r["band"]).strip()
-        if not path.lower().endswith(".fits") or "spherex-d" not in band.lower():
-            continue
-        try:
-            mjd = float(r["mjd"])
-        except (TypeError, ValueError):
-            continue
-        key = (round(mjd, 5), band)
-        if key in seen:              # evita duplicados (p. ej. reprocesamientos)
+    for f in found:                       # la primera colección (más reciente) tiene prioridad
+        key = (f["obs"], f["band"])
+        if key in seen:
             continue
         seen.add(key)
         try:
-            det = int(band.lower().split("spherex-d")[1][:1])
+            det = int(f["band"].lower().split("spherex-d")[1][:1])
         except (IndexError, ValueError):
             det = 0
-        url = f"{IRSA}/{path.lstrip('/')}?center={ra:.8f},{dec:.8f}d&size={size_deg:.5f}"
-        rows.append({"url": url, "mjd": mjd, "band": band, "detector": det})
+        url = f"{f['base']}?center={ra:.8f},{dec:.8f}d&size={size_deg:.5f}"
+        rows.append({"url": url, "mjd": f["mjd"], "band": f["band"], "detector": det,
+                     "collection": f["collection"]})
+    rows.sort(key=lambda r: r["mjd"])
     return rows
 
 
@@ -268,7 +298,8 @@ def build_cube(job_id: str, ra: float, dec: float, fov_arcmin: float, max_images
         visits.sort(key=lambda v: v["mjd"])
         _set(job_id, status="done", result={
             "grid": _grid_info(ra, dec, scale, shape),
-            "visits": visits, "total_found": total_found, "source": "IRSA SPHEREx"})
+            "visits": visits, "total_found": total_found,
+            "source": "IRSA SPHEREx (" + ", ".join(sorted({r.get("collection", "") for r in rows})) + ")"})
     except Exception as exc:  # noqa: BLE001
         _set(job_id, status="error", error=str(exc))
 
