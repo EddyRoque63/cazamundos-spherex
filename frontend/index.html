@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CazaMundos SPHEREx · Buscador de mundos en movimiento</title>
+  <meta name="description" content="Herramienta pública para ver cómo cambia el cielo infrarrojo de SPHEREx con el tiempo: blink, resta de imágenes, color molecular, espectros y curvas de luz.">
+  <link rel="stylesheet" href="css/styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔭</text></svg>">
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8" defer></script>
+  <script src="https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.js" charset="utf-8" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">🔭</span>
+      <div>
+        <h1>CazaMundos <span>SPHEREx</span></h1>
+        <p class="tagline">Buscador de mundos en movimiento · NASA Space Apps 2026</p>
+      </div>
+    </div>
+    <form id="searchForm" class="search" autocomplete="off">
+      <input id="q" type="text" placeholder="Nombre (ej. Barnard's Star) o RA Dec (ej. 08h55m10.8s -07d14m42s)" aria-label="Objeto o coordenadas">
+      <label class="fov">Campo
+        <select id="fov" aria-label="Campo de visión">
+          <option value="3">3′</option>
+          <option value="6" selected>6′</option>
+          <option value="10">10′</option>
+          <option value="15">15′</option>
+          <option value="20">20′</option>
+        </select>
+      </label>
+      <button type="submit" class="btn primary">Buscar</button>
+    </form>
+    <div class="status">
+      <span id="statusChip" class="chip">Conectando…</span>
+      <button id="tutorialBtn" class="btn ghost" type="button">❓ Modo guiado</button>
+    </div>
+  </header>
+
+  <nav class="examples" aria-label="Objetos de prueba">
+    <span>Prueba con:</span>
+    <button class="ex" data-q="Barnard's Star" data-fov="6">⭐ Estrella de Barnard</button>
+    <button class="ex" data-q="eps Ind B" data-fov="6">🟤 Epsilon Indi B</button>
+    <button class="ex" data-q="08h55m10.831s -07d14m42.53s" data-fov="3" data-label="WISE 0855">🟤 WISE 0855</button>
+    <button class="ex" data-q="RW Aur" data-fov="6">✨ RW Aurigae</button>
+    <button class="ex" data-q="R Dra" data-fov="6">✨ R Draconis</button>
+  </nav>
+
+  <div id="progress" class="progress hidden">
+    <div class="bar"><div id="progressFill"></div></div>
+    <span id="progressText">Cargando…</span>
+  </div>
+
+  <main class="layout">
+    <!-- ===================== VISOR ===================== -->
+    <section class="card viewer-card">
+      <div class="card-head">
+        <h2 id="targetName">Elige un objeto para empezar</h2>
+        <span id="targetCoords" class="muted"></span>
+      </div>
+
+      <div class="viewer-wrap">
+        <canvas id="sky" width="640" height="640" aria-label="Imagen animada del cielo SPHEREx"></canvas>
+        <div id="emptyMsg" class="empty">
+          <p>Escribe un objeto o elige un ejemplo.<br>Verás las imágenes infrarrojas de SPHEREx<br>como un pequeño video: lo que se mueve, ¡salta a la vista!</p>
+        </div>
+        <div id="frameBadge" class="frame-badge hidden"></div>
+        <div id="hoverInfo" class="hover-info hidden"></div>
+      </div>
+
+      <div class="player">
+        <button id="prevBtn" class="btn icon" title="Cuadro anterior (←)">⏮</button>
+        <button id="playBtn" class="btn icon primary" title="Reproducir / pausa (espacio)">▶</button>
+        <button id="nextBtn" class="btn icon" title="Cuadro siguiente (→)">⏭</button>
+        <label class="speed">Velocidad <input id="fps" type="range" min="0.5" max="8" step="0.5" value="2"><span id="fpsVal">2</span> c/s</label>
+      </div>
+      <div id="timeline" class="timeline" aria-label="Línea de tiempo"></div>
+
+      <div class="controls">
+        <div class="ctrl-group">
+          <span class="ctrl-label">Modo</span>
+          <div class="seg" id="modeSeg">
+            <button data-mode="normal" class="on">Normal</button>
+            <button data-mode="diff">Resta</button>
+            <button data-mode="color">Color</button>
+          </div>
+        </div>
+        <div class="ctrl-group">
+          <span class="ctrl-label">Agrupar</span>
+          <div class="seg" id="groupSeg">
+            <button data-group="epoch" class="on" title="Suma todas las imágenes de cada pasada de 6 meses (más señal)">Época</button>
+            <button data-group="visit" title="Cada imagen individual (detecta asteroides rápidos)">Visita</button>
+          </div>
+        </div>
+        <div class="ctrl-group" id="detGroup">
+          <span class="ctrl-label">Detector</span>
+          <select id="detector">
+            <option value="all">Todos (0.75–5.0 µm)</option>
+            <option value="1">D1 · 0.75–1.09 µm</option>
+            <option value="2">D2 · 1.10–1.62 µm</option>
+            <option value="3">D3 · 1.63–2.41 µm</option>
+            <option value="4">D4 · 2.42–3.82 µm</option>
+            <option value="5">D5 · 3.83–4.41 µm</option>
+            <option value="6">D6 · 4.42–5.00 µm</option>
+          </select>
+        </div>
+        <div class="ctrl-group hidden" id="diffGroup">
+          <span class="ctrl-label">Restar</span>
+          <select id="diffRef">
+            <option value="median">Cielo promedio (recomendado)</option>
+            <option value="first">Primer cuadro</option>
+            <option value="prev">Cuadro anterior</option>
+          </select>
+        </div>
+        <div class="ctrl-group hidden" id="colorGroup">
+          <span class="ctrl-label">Color</span>
+          <select id="preset">
+            <option value="detectors">Detectores (azul D1–2 · verde D3–4 · rojo D5–6)</option>
+            <option value="methane">Metano CH₄ 3.3 µm (enanas marrones se ven rojas)</option>
+            <option value="water">Agua / hielo H₂O 3.0 µm (absorbentes en magenta)</option>
+            <option value="co2">Dióxido de carbono CO₂ 4.27 µm</option>
+            <option value="co">Monóxido de carbono CO 4.67 µm</option>
+          </select>
+        </div>
+        <div class="ctrl-group">
+          <span class="ctrl-label">Escala</span>
+          <select id="stretch">
+            <option value="asinh">asinh</option>
+            <option value="linear">lineal</option>
+            <option value="log">log</option>
+          </select>
+          <input id="contrast" type="range" min="90" max="99.95" step="0.05" value="99.5" title="Contraste">
+          <label class="chk"><input id="invert" type="checkbox"> Invertir</label>
+        </div>
+      </div>
+
+      <div class="layers">
+        <span class="ctrl-label">Capas</span>
+        <label class="chk"><input type="checkbox" data-layer="gaia"> <i class="dot gaia"></i>Gaia DR3 (mov. propio)</label>
+        <label class="chk"><input type="checkbox" data-layer="catwise"> <i class="dot catwise"></i>CatWISE2020</label>
+        <label class="chk"><input type="checkbox" data-layer="asteroids"> <i class="dot ast"></i>Asteroides conocidos</label>
+        <label class="chk"><input type="checkbox" data-layer="flags"> <i class="dot flag"></i>Banderas de calidad</label>
+        <label class="chk"><input type="checkbox" data-layer="reticle" checked> <i class="dot ret"></i>Retícula</label>
+        <label class="chk" title="No usar píxeles marcados con banderas al sumar imágenes"><input id="maskFlags" type="checkbox"> Excluir píxeles con banderas</label>
+      </div>
+
+      <div class="actions">
+        <button id="markBtn" class="btn">⭐ Marcar candidato</button>
+        <button id="linkBtn" class="btn">🔗 Copiar enlace</button>
+        <button id="embedBtn" class="btn">🧩 Código para incrustar</button>
+        <button id="gifBtn" class="btn">⬇ Descargar animación</button>
+        <label class="chk demo-toggle"><input id="demoToggle" type="checkbox"> Forzar modo demo</label>
+      </div>
+      <p id="frameMeta" class="meta muted"></p>
+    </section>
+
+    <!-- ===================== PANEL DERECHO ===================== -->
+    <aside class="side">
+      <section class="card">
+        <div class="card-head">
+          <h2>Espectro</h2>
+          <span class="muted" id="selInfo">Haz clic en una fuente de la imagen</span>
+        </div>
+        <div id="specPlot" class="plot"></div>
+        <div class="plot-ctrl">
+          <label class="chk"><input id="bbToggle" type="checkbox" checked> Cuerpo negro</label>
+          <input id="bbT" type="range" min="300" max="10000" step="50" value="3000">
+          <span id="bbTVal">3000 K</span>
+          <label class="chk" title="Sigue al objeto si se mueve un poco entre imágenes"><input id="recenter" type="checkbox" checked> Recentrar</label>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>Curva de luz</h2>
+          <label class="chk"><input id="normLc" type="checkbox" checked> Normalizar por detector</label>
+        </div>
+        <div id="lcPlot" class="plot small"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>Contexto (Aladin Lite)</h2>
+          <select id="survey">
+            <option value="P/DSS2/color">DSS2 visible</option>
+            <option value="P/2MASS/color">2MASS infrarrojo</option>
+            <option value="P/allWISE/color">AllWISE infrarrojo medio</option>
+            <option value="P/PanSTARRS/DR1/color-z-zg-g">Pan-STARRS</option>
+          </select>
+        </div>
+        <div id="aladin" class="aladin"></div>
+      </section>
+    </aside>
+
+    <!-- ===================== CANDIDATOS ===================== -->
+    <section class="card candidates">
+      <div class="card-head">
+        <h2>⭐ Candidatos de la comunidad</h2>
+        <span class="muted">Objetos marcados para revisión por astrónomos</span>
+      </div>
+      <form id="candForm" class="cand-form hidden">
+        <span id="candPos" class="mono"></span>
+        <input id="candAuthor" type="text" placeholder="Tu nombre (opcional)" maxlength="80">
+        <input id="candNote" type="text" placeholder="¿Qué viste? (ej. punto rojo que se mueve sin contraparte en Gaia)" maxlength="500" required>
+        <button class="btn primary" type="submit">Guardar</button>
+        <button class="btn ghost" type="button" id="candCancel">Cancelar</button>
+      </form>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Fecha</th><th>RA (°)</th><th>Dec (°)</th><th>Nota</th><th>Autor</th><th></th></tr></thead>
+          <tbody id="candBody"><tr><td colspan="6" class="muted">Aún no hay candidatos.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    Datos: <a href="https://irsa.ipac.caltech.edu/Missions/spherex.html" target="_blank" rel="noopener">NASA/IPAC IRSA · SPHEREx</a> ·
+    Catálogos: <a href="https://vizier.cds.unistra.fr" target="_blank" rel="noopener">CDS VizieR</a> (Gaia DR3, CatWISE2020) ·
+    Asteroides: <a href="https://ssp.imcce.fr/webservices/skybot/" target="_blank" rel="noopener">IMCCE SkyBoT</a> ·
+    Visor de contexto: <a href="https://aladin.cds.unistra.fr/AladinLite/" target="_blank" rel="noopener">Aladin Lite</a>.
+    Proyecto para el NASA Space Apps Challenge 2026 · Reto «Planeta X y SPHEREx».
+  </footer>
+
+  <!-- Modo guiado -->
+  <div id="tutorial" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="tutTitle">
+    <div class="modal-box">
+      <div class="tut-step" id="tutStep"></div>
+      <h3 id="tutTitle"></h3>
+      <p id="tutText"></p>
+      <div class="modal-actions">
+        <button id="tutAction" class="btn primary"></button>
+        <button id="tutNext" class="btn">Siguiente →</button>
+        <button id="tutClose" class="btn ghost">Cerrar</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="js/astro.js"></script>
+  <script src="js/demo.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
